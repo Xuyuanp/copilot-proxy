@@ -171,12 +171,14 @@ var Args struct {
 	OAuthToken  string
 	AccessToken string
 	Addr        string
+	BasePath    string
 }
 
 func init() {
 	flag.StringVar(&Args.OAuthToken, "oauth-token", "", "OAuth token for GitHub API")
 	flag.StringVar(&Args.Addr, "addr", ":8080", "Address to listen on")
 	flag.StringVar(&Args.AccessToken, "access-token", "", "Access token for OpenAI API")
+	flag.StringVar(&Args.BasePath, "base-path", "/api/v1", "Base path for the API")
 }
 
 type Middleware func(http.Handler) http.Handler
@@ -260,11 +262,11 @@ func main() {
 	mux := http.NewServeMux()
 
 	middlewares := []Middleware{
-		stripPrefix("/api"),
+		stripPrefix(Args.BasePath),
 		verifyAccessToken(Args.AccessToken),
 	}
 	apiHandler := applyMiddlewares(source, middlewares...)
-	mux.Handle("/api/", apiHandler)
+	mux.Handle(Args.BasePath+"/", apiHandler)
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		if source.Ready() {
 			return
