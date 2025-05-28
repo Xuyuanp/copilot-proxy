@@ -16,29 +16,34 @@ import (
 	"time"
 )
 
+const (
+	OAuthTokenEndpoint = "https://api.github.com/copilot_internal/v2/token"
+	APIEndpoint        = "https://api.githubcopilot.com"
+)
+
 type APIToken struct {
 	ExpiresAt int64  `json:"expires_at"`
 	RefreshIn int64  `json:"refresh_in"`
 	Token     string `json:"token"`
-	Endpoints struct {
-		API   string `json:"api"`
-		Proxy string `json:"proxy"`
-	} `json:"endpoints"`
 }
 
 type TokenSource struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	apiToken   APIToken
 	oauthToken string
+
+	client *http.Client
 }
 
 func NewTokenSource(oauthToken string) *TokenSource {
 	return &TokenSource{
 		oauthToken: oauthToken,
+
+		client: http.DefaultClient,
 	}
 }
 
-func (ts *TokenSource) start(ctx context.Context) {
+func (ts *TokenSource) Start(ctx context.Context) {
 	var timeout <-chan time.Time
 	var retry <-chan time.Time
 
@@ -46,7 +51,6 @@ func (ts *TokenSource) start(ctx context.Context) {
 	close(first)
 
 	for {
-		var err error
 		select {
 		case <-ctx.Done():
 			return
@@ -58,60 +62,56 @@ func (ts *TokenSource) start(ctx context.Context) {
 			first = nil
 		}
 
-		next, err := ts.refresh(ctx)
-		if err != nil {
+		var apiToken APIToken
+		if err := ts.refresh(ctx, &apiToken); err != nil {
 			slog.Error("failed to refresh token", "error", err, "retry", 5*time.Second)
 			retry = time.After(5 * time.Second)
 			continue
 		}
-		slog.Info("refreshed token")
+		slog.Info("token refreshed", "expires_at", time.Unix(apiToken.ExpiresAt, 0), "refresh_in", time.Duration(apiToken.RefreshIn)*time.Second)
 
-		timeout = next
+		ts.mu.Lock()
+		ts.apiToken = apiToken
+		ts.mu.Unlock()
+
+		timeout = time.After(time.Duration(apiToken.RefreshIn-10) * time.Second)
 	}
 }
 
-func (ts *TokenSource) refresh(ctx context.Context) (<-chan time.Time, error) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/copilot_internal/v2/token", nil)
+func (ts *TokenSource) refresh(ctx context.Context, apiToken *APIToken) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, OAuthTokenEndpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+ts.oauthToken)
 	req.Header.Set("User-Agent", "vscode-chat/dev")
 	req.Header.Set("Accept", "application/json")
 
-	rsp, err := http.DefaultClient.Do(req)
+	rsp, err := ts.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to refresh token: %w", err)
+		return fmt.Errorf("failed to refresh token: %w", err)
 	}
 	defer rsp.Body.Close()
 
 	data, err := io.ReadAll(rsp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if rsp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to refresh token: status: %d, body: %s", rsp.StatusCode, string(data))
+		return fmt.Errorf("failed to refresh token: status: %d, body: %s", rsp.StatusCode, string(data))
 	}
 
-	var token APIToken
-	if err = json.Unmarshal(data, &token); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal token: %w", err)
+	if err = json.Unmarshal(data, apiToken); err != nil {
+		return fmt.Errorf("failed to unmarshal token: %w", err)
 	}
 
-	timeout := time.After(time.Duration(token.RefreshIn-10) * time.Second)
-
-	ts.apiToken = token
-
-	return timeout, nil
+	return nil
 }
 
 func (ts *TokenSource) Ready() bool {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	return ts.ready()
 }
@@ -120,51 +120,43 @@ func (ts *TokenSource) ready() bool {
 	return ts.apiToken.ExpiresAt > time.Now().Unix()
 }
 
-func (ts *TokenSource) Endpoint() string {
-	// ts.mu.Lock()
-	// defer ts.mu.Unlock()
-
-	// if endpoint := ts.apiToken.Endpoints.Proxy; endpoint != "" {
-	// 	return endpoint
-	// }
-	// return ts.apiToken.Endpoints.API
-	return "https://api.githubcopilot.com"
-}
-
 func (ts *TokenSource) Token() string {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	return ts.apiToken.Token
 }
 
-func (ts *TokenSource) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !ts.Ready() {
-		http.Error(w, "Service not ready", http.StatusServiceUnavailable)
-		return
-	}
+func (ts *TokenSource) CustomHeaders(header http.Header) {
+	header.Set("Authorization", "Bearer "+ts.Token())
+	header.Set("User-Agent", "vscode-chat/dev")
+	header.Set("Copilot-Integration-Id", "vscode-chat")
+	header.Set("Editor-Version", "Neovim/0.11.0")
+	header.Set("Editor-Plugin-Version", "copilot-chat/0.1.0")
+}
 
-	slog.Info("proxy", "path", r.URL.Path)
-
-	endpoint := ts.Endpoint()
-	upstream, err := url.Parse(endpoint)
-	if err != nil {
-		http.Error(w, "Invalid upstream URL", http.StatusInternalServerError)
-		return
-	}
-	token := ts.Token()
-
+func (ts *TokenSource) NewProxy(upstream *url.URL) http.Handler {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
-			r.Out.Header.Set("Authorization", "Bearer "+token)
-			r.Out.Header.Set("User-Agent", "vscode-chat/dev")
-			r.Out.Header.Set("Copilot-Integration-Id", "vscode-chat")
-			r.Out.Header.Set("Editor-Version", "Neovim/0.11.0")
-			r.Out.Header.Set("Editor-Plugin-Version", "copilot-chat/0.1.0")
+			ts.CustomHeaders(r.Out.Header)
 		},
 	}
-	proxy.ServeHTTP(w, r)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !ts.Ready() {
+			http.Error(w, "Service not ready", http.StatusServiceUnavailable)
+			return
+		}
+		tracker := TrackStatusCode(w)
+		start := time.Now()
+
+		defer func() {
+			slog.Info("proxied request", "method", r.Method, "url", r.URL.String(), "duration", time.Since(start), "status", tracker.code, "name", "accesslog")
+		}()
+
+		proxy.ServeHTTP(tracker, r)
+	})
 }
 
 var Args struct {
@@ -213,6 +205,35 @@ func verifyAccessToken(token string) Middleware {
 	}
 }
 
+type StatusCodeTracker struct {
+	http.ResponseWriter
+
+	code int
+}
+
+func TrackStatusCode(w http.ResponseWriter) *StatusCodeTracker {
+	return &StatusCodeTracker{ResponseWriter: w, code: 0}
+}
+
+func (s *StatusCodeTracker) WriteHeader(code int) {
+	if s.code != 0 {
+		return
+	}
+	s.code = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *StatusCodeTracker) Write(b []byte) (int, error) {
+	if s.code == 0 {
+		s.code = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *StatusCodeTracker) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 func parseOAuthToken() (string, error) {
 	apps := filepath.Join(os.Getenv("HOME"), ".config/github-copilot/apps.json")
 	data, err := os.ReadFile(apps)
@@ -254,10 +275,13 @@ func main() {
 		Args.OAuthToken = oauthToken
 	}
 
-	source := NewTokenSource(Args.OAuthToken)
+	ts := NewTokenSource(Args.OAuthToken)
+
+	upstream, _ := url.Parse(APIEndpoint)
+	proxy := ts.NewProxy(upstream)
 
 	ctx := context.Background()
-	go source.start(ctx)
+	go ts.Start(ctx)
 
 	mux := http.NewServeMux()
 
@@ -265,10 +289,12 @@ func main() {
 		stripPrefix(Args.BasePath),
 		verifyAccessToken(Args.AccessToken),
 	}
-	apiHandler := applyMiddlewares(source, middlewares...)
+	apiHandler := applyMiddlewares(proxy, middlewares...)
 	mux.Handle(Args.BasePath+"/", apiHandler)
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		if source.Ready() {
+		if ts.Ready() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("OK"))
 			return
 		}
 		http.Error(w, "Service not ready", http.StatusServiceUnavailable)
