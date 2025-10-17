@@ -21,6 +21,13 @@ const (
 	APIEndpoint        = "https://api.githubcopilot.com"
 )
 
+func init() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+	}))
+	slog.SetDefault(logger)
+}
+
 type APIToken struct {
 	ExpiresAt int64  `json:"expires_at"`
 	RefreshIn int64  `json:"refresh_in"`
@@ -47,6 +54,9 @@ func (ts *TokenSource) Start(ctx context.Context) {
 	var timeout <-chan time.Time
 	var retry <-chan time.Time
 
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
 	first := make(chan struct{})
 	close(first)
 
@@ -60,6 +70,11 @@ func (ts *TokenSource) Start(ctx context.Context) {
 			retry = nil
 		case <-first:
 			first = nil
+		case <-ticker.C:
+		}
+
+		if ts.Ready() {
+			continue
 		}
 
 		var apiToken APIToken
