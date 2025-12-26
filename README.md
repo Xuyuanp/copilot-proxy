@@ -13,7 +13,7 @@ A proxy server to expose OpenAI-compatible endpoints for GitHub Copilot API
 ## Requirements
 
 - Valid Copilot-enabled GitHub OAuth token
-- Github Copilot `oauth_token` or a valid `~/.config/github-copilot/apps.json` file
+- GitHub Copilot `oauth_token` or a valid `~/.config/github-copilot/apps.json` file
 
 ### Build
 
@@ -25,7 +25,7 @@ go build -o copilot-proxy main.go
 
 ```bash
 # binary
-./copilot-proxy -oauth-token <GITHUB_OAUTH_TOKEN> -access-token <randome token> [flags...]
+./copilot-proxy -oauth-token <GITHUB_OAUTH_TOKEN> -access-token <random token> [flags...]
 
 # docker
 docker run -d \
@@ -42,6 +42,12 @@ Supported flags:
 - `-access-token` — (optional) Access token for user authentication to the proxy itself
 - `-addr` — Address to listen on (default: `:8080`)
 - `-base-path` — Base API path to match and remove from incoming requests (default: `/api/v1`)
+
+## Health Check
+
+`GET /ready`
+
+Returns `200 OK` if the token is valid and ready to use.
 
 ## Examples:
 
@@ -80,6 +86,6 @@ In the file `~/.config/github-copilot/apps.json`, you can find your GitHub Copil
 
 ## Q: What if I don't have the file `~/.config/github-copilot/apps.json`?
 
-1. If you have [Zed](https://zed.dev/) installed, you can sing in to GitHub Copilot in Zed.
+1. If you have [Zed](https://zed.dev/) installed, you can sign in to GitHub Copilot in Zed.
 2. If you are familiar with Neovim, you can either install [copilot.vim](https://github.com/github/copilot.vim) or [copilot.lua](https://github.com/zbirenbaum/copilot.lua) to sign in to GitHub Copilot.
 3. You still need to install Neovim (>=0.11.0) and [copilot-language-server](https://github.com/github/copilot-language-server-release), run command `nvim -n --headless -u nvim/init.lua tmp.c` and follow the instructions.
