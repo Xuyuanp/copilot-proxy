@@ -19,6 +19,7 @@ import (
 const (
 	OAuthTokenEndpoint = "https://api.github.com/copilot_internal/v2/token"
 	APIEndpoint        = "https://api.githubcopilot.com"
+	GitHubAPIEndpoint  = "https://api.github.com"
 )
 
 func init() {
@@ -167,7 +168,29 @@ func (ts *TokenSource) NewProxy(upstream *url.URL) http.Handler {
 		start := time.Now()
 
 		defer func() {
-			slog.Info("proxied request", "method", r.Method, "url", r.URL.String(), "duration", time.Since(start), "status", tracker.code, "name", "accesslog")
+			slog.Info("proxied request", "method", r.Method, "url", r.URL.String(), "duration", time.Since(start).String(), "status", tracker.code, "name", "accesslog")
+		}()
+
+		proxy.ServeHTTP(tracker, r)
+	})
+}
+
+func (ts *TokenSource) NewGitHubAPIProxy(upstream *url.URL) http.Handler {
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(upstream)
+			r.Out.Header.Set("Authorization", "Bearer "+ts.oauthToken)
+			r.Out.Header.Set("User-Agent", "vscode-chat/dev")
+			r.Out.Header.Set("Accept", "application/json")
+		},
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tracker := TrackStatusCode(w)
+		start := time.Now()
+
+		defer func() {
+			slog.Info("proxied request", "method", r.Method, "url", r.URL.String(), "duration", time.Since(start).String(), "status", tracker.code, "name", "accesslog")
 		}()
 
 		proxy.ServeHTTP(tracker, r)
@@ -306,6 +329,11 @@ func main() {
 	}
 	apiHandler := applyMiddlewares(proxy, middlewares...)
 	mux.Handle(Args.BasePath+"/", apiHandler)
+
+	githubUpstream, _ := url.Parse(GitHubAPIEndpoint)
+	githubProxy := ts.NewGitHubAPIProxy(githubUpstream)
+	githubHandler := applyMiddlewares(githubProxy, verifyAccessToken(Args.AccessToken))
+	mux.Handle("/copilot_internal/", githubHandler)
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
 		if ts.Ready() {
 			w.WriteHeader(http.StatusOK)
